@@ -11,25 +11,24 @@ from ryu.lib import hub
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, arp, ipv4
 from ryu.lib.packet import ether_types
-import itertools
 
 class TrafficMonitor(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(TrafficMonitor, self).__init__(*args, **kwargs)
-        self.port_iterator = {}
         
+        # Configuración del logger
         logging.basicConfig(level=logging.INFO)
         self.datapaths = {}
         self.metrics = {
             "cpu": 0,
             "memory": 0,
             "switches": {},
-            "devices": {},
+            "devices": {},  # Registro de dispositivos finales
             "events": []
         }
-        self.mac_to_port = {}
+        self.mac_to_port = {}  # Diccionario para aprender direcciones MAC
         self.monitor_thread = hub.spawn(self._monitor)
         threading.Thread(target=self.start_http_server, daemon=True).start()
 
@@ -43,6 +42,7 @@ class TrafficMonitor(app_manager.RyuApp):
         app.run(host='0.0.0.0', port=5000)
 
     def _monitor(self):
+        """Monitoriza periódicamente estadísticas de switches y recursos del sistema."""
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
@@ -65,6 +65,7 @@ class TrafficMonitor(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [CONFIG_DISPATCHER, MAIN_DISPATCHER])
     def _state_change_handler(self, ev):
+        """Registra switches solo si se encuentran en un estado válido."""
         datapath = ev.datapath
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
         if ev.state == MAIN_DISPATCHER:
@@ -84,6 +85,7 @@ class TrafficMonitor(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        """Gestiona paquetes, reenvía tráfico y registra dispositivos conectados."""
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -93,6 +95,7 @@ class TrafficMonitor(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
+        #Ignorar paquetes no Ethernet
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
@@ -101,34 +104,45 @@ class TrafficMonitor(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
+        # Aprende la dirección MAC de la fuente
         self.mac_to_port[dpid][src] = in_port
 
+        # Registrar información del dispositivo conectado
         self._register_device(dpid, in_port, src, pkt)
 
+        # Verifica si conoce la salida para la dirección MAC de destino
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
-            out_port = self.balancear_trafico(datapath, dst)
+            out_port = ofproto.OFPP_FLOOD
 
+        # Crea acciones de reenvío
         actions = [parser.OFPActionOutput(out_port)]
 
+        # Verifica los valores antes de instalar el flujo
         self.logger.info(f"Match para flujo: in_port={in_port}, eth_src={src}, eth_dst={dst}")
         self.logger.info(f"out_port={out_port}, in_port={in_port}, src={src}, dst={dst}")
         self.logger.info(f"Instalando flujo: in_port={in_port}, dst={dst}, src={src}, out_port={out_port}")
         
+        # Instala una regla de flujo si conoce el puerto de salida
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             self.add_flow(datapath, 1, match, actions)
+        # match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+        # self.add_flow(datapath, 1, match, actions)
 
+        # Envía el paquete al puerto de salida
         out = parser.OFPPacketOut(
             datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
         datapath.send_msg(out)
 
     def _register_device(self, dpid, port, mac, pkt):
+        """Registra dispositivos conectados a un switch."""
         dispositivo_registrado = False
         
         for p in pkt.protocols:
             if isinstance(p, arp.arp):
+                # Si es un paquete ARP, registrar MAC e IP
                 ip = p.src_ip
                 self.metrics["devices"][mac] = {
                     "ip": ip,
@@ -141,6 +155,7 @@ class TrafficMonitor(app_manager.RyuApp):
                 )
                 dispositivo_registrado = True
             elif isinstance(p, ipv4.ipv4):
+                # Si es un paquete IPv4, registrar MAC e IP
                 ip = p.src
                 self.metrics["devices"][mac] = {
                     "ip": ip,
@@ -160,6 +175,7 @@ class TrafficMonitor(app_manager.RyuApp):
                 )
 
     def add_flow(self, datapath, priority, match, actions):
+        """Agrega una entrada de flujo a la tabla del switch."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -172,31 +188,10 @@ class TrafficMonitor(app_manager.RyuApp):
         print(f"Instalando flujo... {mod}")
         
         datapath.send_msg(mod)
-        
-    #============================================================================================
-    def balancear_trafico(self, datapath, dst):
-        dpid = datapath.id
-        ofproto = datapath.ofproto
 
-        if dpid not in self.metrics["switches"]:
-            if dpid not in self.port_iterator:
-                self.port_iterator[dpid] = itertools.cycle(
-                    port for port in range(1, 50) if port not in [ofproto.OFPP_FLOOD, ofproto.OFPP_CONTROLLER]
-                )
-            return next(self.port_iterator[dpid])
-
-        puertos_estadisticas = self.metrics["switches"].get(dpid, {})
-        puerto_seleccionado = min(
-            puertos_estadisticas.items(),
-            key=lambda item: item[1]["tx_bytes"],
-            default=(ofproto.OFPP_FLOOD, {})
-        )[0]
-
-        return puerto_seleccionado if puerto_seleccionado != ofproto.OFPP_FLOOD else ofproto.OFPP_CONTROLLER
-    #============================================================================================
-    
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
+        """Procesa estadísticas de puertos únicamente para switches conectados."""
         body = ev.msg.body
         switch_id = ev.msg.datapath.id
         self.metrics["switches"].setdefault(switch_id, {})

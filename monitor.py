@@ -11,7 +11,9 @@ from ryu.lib import hub
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, arp, ipv4
 from ryu.lib.packet import ether_types
+from scapy.all import *
 import itertools
+
 
 class TrafficMonitor(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -26,11 +28,11 @@ class TrafficMonitor(app_manager.RyuApp):
             "cpu": 0,
             "memory": 0,
             "switches": {},
-            "devices": [{"ip": "10.0.0.1", "mac":"2R:D5:42:56:FR:4C", "switch":"S1", "port":"1", "band": "23", "priority":"42"},
-                        {"ip": "10.0.0.2", "mac":"2R:D5:42:56:FR:4D", "switch":"S1", "port":"2", "band": "11", "priority":"11"},
-                        {"ip": "10.0.0.3", "mac":"2R:D5:42:56:FR:4E", "switch":"S1", "port":"3", "band": "19", "priority":"4"},
-                        {"ip": "10.0.0.4", "mac":"2R:D5:42:56:FR:4F", "switch":"S1", "port":"4", "band": "7", "priority":"8"},
-                        {"ip": "10.0.0.5", "mac":"2R:D5:42:56:FR:4G", "switch":"S1", "port":"5", "band": "5", "priority":"2"}
+            "devices": [{"ip": "10.0.0.1", "mac":"2R:D5:42:56:FR:4C", "switch":"1", "port":"1", "band": 0.0, "priority":"42"},
+                        {"ip": "10.0.0.2", "mac":"2R:D5:42:56:FR:4D", "switch":"1", "port":"2", "band": 0.0, "priority":"11"},
+                        {"ip": "10.0.0.3", "mac":"2R:D5:42:56:FR:4E", "switch":"2", "port":"3", "band": 0.0, "priority":"4"},
+                        {"ip": "10.0.0.4", "mac":"2R:D5:42:56:FR:4F", "switch":"3", "port":"4", "band": 0.0, "priority":"8"},
+                        {"ip": "10.0.0.5", "mac":"2R:D5:42:56:FR:4G", "switch":"4", "port":"5", "band": 0.0, "priority":"2"}
                         ],
             "events": [],
             "notifications": []
@@ -53,7 +55,8 @@ class TrafficMonitor(app_manager.RyuApp):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             self._log_system_stats()
-            hub.sleep(10)
+            self._calculate_bandwidth()
+            hub.sleep(3)
 
     def _log_system_stats(self):
         cpu_usage = psutil.cpu_percent()
@@ -79,7 +82,7 @@ class TrafficMonitor(app_manager.RyuApp):
                 self.logger.info("Switch %s conectado", datapath.id)
                 self.setup_qos(datapath, port=1, max_rate=500, min_rate=100)
                 self.metrics["notifications"].append(
-                    {"timestamp": timestamp, "title": "Aplicacion de QoS", "subtitle": f"aplicada QoS en el switch{datapath.id}", "description": f"Se ha aplicado correctamente la politica de QoS a {datapath}"}
+                    {"timestamp": timestamp, "title": "Aplicacion de QoS", "subtitle": f"Se ha aplicado con exito QoS en el switch{datapath.id}", "description": f"Se ha aplicado correctamente la politica de QoS a {datapath}"}
                 )
                 self.metrics["events"].append(
                     {"timestamp": timestamp, "event": f"Switch {datapath.id} conectado"}
@@ -120,11 +123,10 @@ class TrafficMonitor(app_manager.RyuApp):
         else:
             out_port = self.balancear_trafico(datapath, dst)
 
-        # Agregar lógica para asignar colas QoS
-        queue_id = 1  # Cambia el ID de la cola según tus necesidades
+        queue_id = 1
         actions = [
-            parser.OFPActionSetQueue(queue_id=queue_id),  # Asignar el flujo a la cola QoS
-            parser.OFPActionOutput(out_port)             # Salida al puerto correspondiente
+            parser.OFPActionSetQueue(queue_id=queue_id),
+            parser.OFPActionOutput(out_port)
         ]
     
         self.logger.info(f"Match para flujo: in_port={in_port}, eth_src={src}, eth_dst={dst}")
@@ -179,25 +181,15 @@ class TrafficMonitor(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
     
-        # Crear las instrucciones de flujo (aplicar acciones)
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         
-        # Crear la modificación de flujo (OFPFlowMod)
         mod = parser.OFPFlowMod(
            datapath=datapath, priority=priority, match=match, instructions=inst
         )
     
-        # Log para depuración
         self.logger.info(f"Instalando flujo: {mod}")
-        print(f"Instalando flujo... {mod}")
     
-        # Enviar el mensaje para instalar el flujo
         datapath.send_msg(mod)
-    
-    def send_notification(self, port, max_rate, min_rate, burst_size, notifications):
-        self.metrics["devices"][notifications] = {
-                    "message": f"QoS configurado en puerto:{port}, max_rate={max_rate}, min_rate={min_rate}, burst_size={burst_size}",
-                }
     #============================================================================================
     def balancear_trafico(self, datapath, dst):
         dpid = datapath.id
@@ -223,29 +215,20 @@ class TrafficMonitor(app_manager.RyuApp):
          ofproto = datapath.ofproto
          parser = datapath.ofproto_parser
     
-        # Si no se especifica tasa máxima, usar un valor por defecto
          if max_rate is None:
-             max_rate = 1000  # 100% de la capacidad
+             max_rate = 1000
 
-        # Definir una cola de QoS con propiedades específicas
-         queue_id = 1  # ID de la cola (puedes usar diferentes IDs de colas)
+         queue_id = 1
          actions = []
      
-        # Crear una lista de propiedades de la cola si se especifican tasas
          if max_rate is not None:
-             actions.append(parser.OFPActionSetQueue(queue_id=queue_id))  # Asignar la cola de QoS
+             actions.append(parser.OFPActionSetQueue(queue_id=queue_id))
     
-        # Aquí podemos agregar más reglas si se requiere aplicar alguna política de QoS adicional
-        # Los valores de max_rate y min_rate se manejarían en las reglas de flujo
-    
-        # Crear un flujo para asignar QoS en el puerto especificado
          match = parser.OFPMatch(in_port=port)
          inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
     
-        # Crear el mensaje de flujo
          mod = parser.OFPFlowMod(datapath=datapath, match=match, priority=1, instructions=inst)
     
-        # Enviar el mensaje para instalar el flujo
          datapath.send_msg(mod)
     
          self.logger.info(
@@ -253,9 +236,23 @@ class TrafficMonitor(app_manager.RyuApp):
              port, max_rate, min_rate, burst_size,
          )
          
-     
+    def _calculate_bandwidth(self):
+        for switch_id, ports in self.metrics["switches"].items():
+            for port_no, stats in ports.items():
+                tx_bytes = stats.get("tx_bytes", 0)
+                rx_bytes = stats.get("rx_bytes", 0)
+
+                bandwidth = (tx_bytes + rx_bytes) * 8
+                bandwidth_mbps = round((bandwidth / 1024 / 1024), 2)
+
+                for device in self.metrics["devices"]:
+                    if device["switch"] == f"{str(switch_id)}" and device["port"] == str(port_no):
+                        device["band"] = bandwidth_mbps
+                        self.logger.info(
+                            "Ancho de banda actualizado: switch=%s, puerto=%s, banda=%s Mbps",
+                            switch_id, port_no, bandwidth_mbps
+                        )
     #============================================================================================
-    
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         body = ev.msg.body
